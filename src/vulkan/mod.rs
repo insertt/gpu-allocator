@@ -4,7 +4,7 @@
 mod visualizer;
 use std::{backtrace::Backtrace, fmt, marker::PhantomData, sync::Arc};
 
-use ash::vk;
+use spark::{vk, Builder as _};
 use log::{debug, Level};
 #[cfg(feature = "visualizer")]
 pub use visualizer::AllocatorVisualizer;
@@ -55,8 +55,8 @@ unsafe impl Send for SendSyncPtr {}
 unsafe impl Sync for SendSyncPtr {}
 
 pub struct AllocatorCreateDesc {
-    pub instance: ash::Instance,
-    pub device: ash::Device,
+    pub instance: spark::Instance,
+    pub device: spark::Device,
     pub physical_device: vk::PhysicalDevice,
     pub debug_settings: AllocatorDebugSettings,
     pub buffer_device_address: bool,
@@ -154,7 +154,7 @@ pub struct Allocation {
     size: u64,
     memory_block_index: usize,
     memory_type_index: usize,
-    device_memory: vk::DeviceMemory,
+    device_memory: Option<vk::DeviceMemory>,
     mapped_ptr: Option<SendSyncPtr>,
     dedicated_allocation: bool,
     memory_properties: vk::MemoryPropertyFlags,
@@ -212,10 +212,10 @@ impl Allocation {
     /// without this library, because that will lead to undefined behavior.
     ///
     /// # Safety
-    /// The result of this function can safely be used to pass into [`ash::Device::bind_buffer_memory()`],
-    /// [`ash::Device::bind_image_memory()`] etc. It is exposed for this reason. Keep in mind to also
+    /// The result of this function can safely be used to pass into [`spark::Device::bind_buffer_memory()`],
+    /// [`spark::Device::bind_image_memory()`] etc. It is exposed for this reason. Keep in mind to also
     /// pass [`Self::offset()`] along to those.
-    pub unsafe fn memory(&self) -> vk::DeviceMemory {
+    pub unsafe fn memory(&self) -> Option<vk::DeviceMemory> {
         self.device_memory
     }
 
@@ -270,7 +270,7 @@ impl Default for Allocation {
             size: 0,
             memory_block_index: !0,
             memory_type_index: !0,
-            device_memory: vk::DeviceMemory::null(),
+            device_memory: None,
             mapped_ptr: None,
             memory_properties: vk::MemoryPropertyFlags::empty(),
             name: None,
@@ -342,7 +342,7 @@ pub(crate) struct MemoryBlock {
 
 impl MemoryBlock {
     fn new(
-        device: &ash::Device,
+        device: &spark::Device,
         size: u64,
         mem_type_index: usize,
         mapped: bool,
@@ -351,29 +351,29 @@ impl MemoryBlock {
         requires_personal_block: bool,
     ) -> Result<Self> {
         let device_memory = {
-            let alloc_info = vk::MemoryAllocateInfo::default()
+            let alloc_info = vk::MemoryAllocateInfo::builder()
                 .allocation_size(size)
                 .memory_type_index(mem_type_index as u32);
 
             let allocation_flags = vk::MemoryAllocateFlags::DEVICE_ADDRESS;
-            let mut flags_info = vk::MemoryAllocateFlagsInfo::default().flags(allocation_flags);
+            let mut flags_info = vk::MemoryAllocateFlagsInfo::builder().flags(allocation_flags);
             // TODO(manon): Test this based on if the device has this feature enabled or not
             let alloc_info = if buffer_device_address {
-                alloc_info.push_next(&mut flags_info)
+                alloc_info.insert_next(&mut flags_info)
             } else {
                 alloc_info
             };
 
             // Flag the memory as dedicated if required.
-            let mut dedicated_memory_info = vk::MemoryDedicatedAllocateInfo::default();
+            let mut dedicated_memory_info = vk::MemoryDedicatedAllocateInfo::builder();
             let alloc_info = match allocation_scheme {
                 AllocationScheme::DedicatedBuffer(buffer) => {
-                    dedicated_memory_info = dedicated_memory_info.buffer(buffer);
-                    alloc_info.push_next(&mut dedicated_memory_info)
+                    dedicated_memory_info = dedicated_memory_info.buffer(Some(buffer));
+                    alloc_info.insert_next(&mut dedicated_memory_info)
                 }
                 AllocationScheme::DedicatedImage(image) => {
-                    dedicated_memory_info = dedicated_memory_info.image(image);
-                    alloc_info.push_next(&mut dedicated_memory_info)
+                    dedicated_memory_info = dedicated_memory_info.image(Some(image));
+                    alloc_info.insert_next(&mut dedicated_memory_info)
                 }
                 AllocationScheme::GpuAllocatorManaged => alloc_info,
             };
@@ -398,7 +398,7 @@ impl MemoryBlock {
                     )
                 }
                 .map_err(|e| {
-                    unsafe { device.free_memory(device_memory, None) };
+                    unsafe { device.free_memory(Some(device_memory), None) };
                     AllocationError::FailedToMap(e.to_string())
                 })
                 .and_then(|p| {
@@ -428,12 +428,12 @@ impl MemoryBlock {
         })
     }
 
-    fn destroy(self, device: &ash::Device) {
+    fn destroy(self, device: &spark::Device) {
         if self.mapped_ptr.is_some() {
             unsafe { device.unmap_memory(self.device_memory) };
         }
 
-        unsafe { device.free_memory(self.device_memory, None) };
+        unsafe { device.free_memory(Some(self.device_memory), None) };
     }
 }
 
@@ -451,7 +451,7 @@ pub(crate) struct MemoryType {
 impl MemoryType {
     fn allocate(
         &mut self,
-        device: &ash::Device,
+        device: &spark::Device,
         desc: &AllocationCreateDesc<'_>,
         granularity: u64,
         backtrace: Arc<Backtrace>,
@@ -528,7 +528,7 @@ impl MemoryType {
                 size,
                 memory_block_index: block_index,
                 memory_type_index: self.memory_type_index,
-                device_memory: mem_block.device_memory,
+                device_memory: Some(mem_block.device_memory),
                 mapped_ptr: mem_block.mapped_ptr,
                 memory_properties: self.memory_properties,
                 name: Some(desc.name.into()),
@@ -563,7 +563,7 @@ impl MemoryType {
                             size,
                             memory_block_index: mem_block_i,
                             memory_type_index: self.memory_type_index,
-                            device_memory: mem_block.device_memory,
+                            device_memory: Some(mem_block.device_memory),
                             memory_properties: self.memory_properties,
                             mapped_ptr,
                             dedicated_allocation: false,
@@ -637,7 +637,7 @@ impl MemoryType {
             size,
             memory_block_index: new_block_index,
             memory_type_index: self.memory_type_index,
-            device_memory: mem_block.device_memory,
+            device_memory: Some(mem_block.device_memory),
             mapped_ptr,
             memory_properties: self.memory_properties,
             name: Some(desc.name.into()),
@@ -646,7 +646,7 @@ impl MemoryType {
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    fn free(&mut self, allocation: Allocation, device: &ash::Device) -> Result<()> {
+    fn free(&mut self, allocation: Allocation, device: &spark::Device) -> Result<()> {
         let block_idx = allocation.memory_block_index;
 
         let mem_block = self.memory_blocks[block_idx]
@@ -682,7 +682,7 @@ impl MemoryType {
 pub struct Allocator {
     pub(crate) memory_types: Vec<MemoryType>,
     pub(crate) memory_heaps: Vec<vk::MemoryHeap>,
-    device: ash::Device,
+    device: spark::Device,
     pub(crate) buffer_image_granularity: u64,
     pub(crate) debug_settings: AllocatorDebugSettings,
     allocation_sizes: AllocationSizes,
@@ -696,19 +696,13 @@ impl fmt::Debug for Allocator {
 
 impl Allocator {
     pub fn new(desc: &AllocatorCreateDesc) -> Result<Self> {
-        if desc.physical_device == vk::PhysicalDevice::null() {
-            return Err(AllocationError::InvalidAllocatorCreateDesc(
-                "AllocatorCreateDesc field `physical_device` is null.".into(),
-            ));
-        }
-
         let mem_props = unsafe {
             desc.instance
                 .get_physical_device_memory_properties(desc.physical_device)
         };
 
-        let memory_types = &mem_props.memory_types_as_slice();
-        let memory_heaps = mem_props.memory_heaps_as_slice().to_vec();
+        let memory_types = &mem_props.memory_types;
+        let memory_heaps = mem_props.memory_heaps.to_vec();
 
         if desc.debug_settings.log_memory_information {
             debug!("memory type count: {}", mem_props.memory_type_count);
@@ -717,17 +711,17 @@ impl Allocator {
             for (i, mem_type) in memory_types.iter().enumerate() {
                 let flags = mem_type.property_flags;
                 debug!(
-                    "memory type[{}]: prop flags: 0x{:x}, heap[{}]",
+                    "memory type[{}]: prop flags: {}, heap[{}]",
                     i,
-                    flags.as_raw(),
+                    flags,
                     mem_type.heap_index,
                 );
             }
             for (i, heap) in memory_heaps.iter().enumerate() {
                 debug!(
-                    "heap[{}] flags: 0x{:x}, size: {} MiB",
+                    "heap[{}] flags: {}, size: {} MiB",
                     i,
-                    heap.flags.as_raw(),
+                    heap.flags,
                     heap.size / (1024 * 1024)
                 );
             }
