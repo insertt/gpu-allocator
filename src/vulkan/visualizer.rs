@@ -96,8 +96,6 @@ impl AllocatorVisualizer {
                                 let Some(block) = block else { continue };
 
                                 ui.collapsing(format!("Block: {}", block_idx), |ui| {
-                                    use ash::vk::Handle;
-
                                     ui.label(format!("size: {} KiB", block.size / 1024));
                                     ui.label(format!(
                                         "allocated: {} KiB",
@@ -105,7 +103,7 @@ impl AllocatorVisualizer {
                                     ));
                                     ui.label(format!(
                                         "vk device memory: 0x{:x}",
-                                        block.device_memory.as_raw()
+                                        unsafe { std::mem::transmute::<_, std::num::NonZeroU64>(block.device_memory) }
                                     ));
                                     if let Some(mapped_ptr) = block.mapped_ptr {
                                         ui.label(format!(
